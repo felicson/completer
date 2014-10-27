@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"flag"
 	"fmt"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/tchap/go-patricia/patricia"
@@ -11,7 +12,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	//"pid"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -24,9 +27,10 @@ const (
 )
 
 var (
-	db, sph_db *sql.DB
+	db *sql.DB
 
-	SKIPPED_WORDS = map[string]bool{"и": true, "для": true}
+	SKIPPED_WORDS          = map[string]bool{"и": true, "для": true}
+	mysql_socket, mysql_db string
 )
 
 type Complete struct {
@@ -51,6 +55,10 @@ func query_prepare(raw string) string {
 	var l int
 	for c, i := range raw {
 
+		if unicode.IsUpper(i) {
+			i = unicode.ToLower(i)
+		}
+
 		switch {
 		case unicode.IsLetter(i):
 			if c > 0 && unicode.IsDigit(rune(raw[c-1])) {
@@ -59,9 +67,6 @@ func query_prepare(raw string) string {
 			}
 			l = utf8.RuneLen(i)
 
-			if unicode.IsUpper(i) {
-				i = unicode.ToLower(i)
-			}
 			out.WriteString(string(i))
 			continue
 
@@ -79,21 +84,15 @@ func query_prepare(raw string) string {
 			out.Write([]byte(" "))
 		}
 	}
-	str := out.Bytes()
-
-	if !bytes.HasSuffix(str, []byte("* ")) {
-
-		//out.Write([]byte("*"))
-	}
 	return out.String()
 }
 
 func db_query(ids string) []byte {
 
-	rows, err := db.Query(fmt.Sprintf("SELECT name,cpu FROM rubrics WHERE id IN(%s)", ids))
+	rows, err := db.Query(fmt.Sprintf("SELECT name,cpu FROM rubrics WHERE id IN(%s) ORDER BY FIELD(id,%s)", ids, ids))
 
 	if err != nil {
-		panic(err)
+		dbOpen()
 	}
 
 	defer rows.Close()
@@ -118,74 +117,92 @@ func db_query(ids string) []byte {
 
 }
 
-func sphinx(query string) []byte {
+type ranker struct {
+	rubId  int
+	weight int
+}
 
-	var buf []string
-	var ids string
+type rankerList []*ranker
 
-	query = query_prepare(query)
+func (r *rankerList) Len() int {
 
-	//fmt.Println(query)
-	if val, ok := cache[query]; ok {
+	return len(*r)
+}
 
-		ids = val.key
+func (r rankerList) Swap(i, j int) {
 
-	} else {
+	r[j], r[i] = r[i], r[j]
+}
 
-		rows, err := sph_db.Query(fmt.Sprintf("SELECT sphinx_internal_id FROM rubric WHERE MATCH('%s') AND counter > 0 LIMIT 25 OPTION max_matches=40;", query))
+func (r rankerList) Less(i, j int) bool {
 
-		if err != nil {
-			panic(err)
+	return r[i].weight > r[j].weight
+}
+
+func (r *rankerList) String() string {
+
+	var str bytes.Buffer
+
+	length := len(*r) - 1
+
+	for i, rr := range *r {
+
+		str.WriteString(strconv.Itoa(rr.rubId))
+
+		if i > 10 {
+			break
 		}
 
-		defer rows.Close()
-
-		var id int
-
-		for rows.Next() {
-
-			err = rows.Scan(&id)
-
-			if err != nil {
-				panic(err)
-			}
-			buf = append(buf, strconv.Itoa(id))
-
+		if i < length {
+			str.WriteString(",")
 		}
-		ids = strings.Join(buf, ",")
-
-		cache[query] = &Cacher{ids, time.Now()}
 	}
 
-	if ids != "" {
-		return db_query(ids)
-	}
-	return []byte("[]")
+	if len(*r) > 0 {
 
+		return str.String()
+	}
+	return ""
 }
 
 func sphinx2(query string) []byte {
 
 	query = query_prepare(query)
 
-	var buf []string
-	var ids string
+	buf := new(rankerList)
 
-	err := trie.VisitSubtree(patricia.Prefix(query), func(prefix patricia.Prefix, item patricia.Item) error {
+	ccache := make(map[int]*ranker, 1)
 
-		buf = append(buf, strconv.Itoa(item.(int)))
-		return nil
-	})
 
-	if err != nil {
-		panic(err)
+	for _, word := range strings.Fields(query) {
+
+		err := trie.VisitSubtree(patricia.Prefix(word), func(prefix patricia.Prefix, item patricia.Item) error {
+
+			rubId := item.(int)
+
+			if v, ok := ccache[rubId]; ok {
+				v.weight = v.weight + 1
+			} else {
+				rank := &ranker{rubId, 1}
+				ccache[rubId] = rank
+				*buf = append(*buf, rank)
+			}
+
+			return nil
+		})
+
+		if err != nil {
+			panic(err)
+		}
 	}
 
-	ids = strings.Join(buf, ",")
+	sort.Sort(buf)
 
-	if ids != "" {
-		return db_query(ids)
-	}
+	_ = (*buf).String()
+
+	//if ids != "" {
+	//	return db_query(ids)
+	//}
 
 	return []byte("[]")
 }
@@ -251,24 +268,38 @@ func cache_cleaner() {
 	}
 }
 
-func init() {
+func dbOpen() error {
 
 	var err error
-	sph_db, err = sql.Open("mysql", "tcp(127.0.0.1:9308)/rubric")
+	db, err = sql.Open("mysql", fmt.Sprintf("myprom:weronica@unix(%s)/%s?parseTime=true", mysql_socket, mysql_db))
+	//fmt.Printf("+++++ %v\n",err)
+	return err
 
-	if err != nil {
-		panic(err)
-	}
+}
 
-	db, err = sql.Open("mysql", "myprom:weronica@unix(/var/run/mysqld/mysqld.sock)/myprom_ror?parseTime=true")
+func init() {
 
-	if err != nil {
-		panic(err)
-	}
+	flag.StringVar(&mysql_socket, "mysql-socket", "/tmp/mysql.sock", "mysql-socket=/sock/path.sock")
+	flag.StringVar(&mysql_db, "mysql-db", "myprom", "mysql-db=mydb")
 
 	trie = patricia.NewTrie()
 
-	rows, err := db.Query("SELECT name,id FROM rubrics")
+}
+
+func main() {
+
+	flag.Parse()
+
+	runtime.GOMAXPROCS(2)
+
+	cache = make(t_cache, 1)
+
+	err := dbOpen()
+	if err != nil {
+		panic(err)
+	}
+
+	rows, err := db.Query("SELECT name,id FROM rubrics WHERE counter > 0")
 
 	if err != nil {
 		panic(err)
@@ -290,22 +321,21 @@ func init() {
 		}
 		name = query_prepare(name)
 
-		trie.Insert(patricia.Prefix(name), id)
+		for _, word := range strings.Fields(name) {
+
+			word = fmt.Sprintf("%s_%d", word, id)
+
+			trie.Insert(patricia.Prefix(word), id)
+		}
 	}
-}
-
-func main() {
-
-	runtime.GOMAXPROCS(2)
-
-	cache = make(t_cache, 1)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/completer/", completer)
 
 	go cache_cleaner()
 
-	err := Run(mux)
+	//pid.CreatePid()
+	err = Run(mux)
 	if err != nil {
 		panic(err)
 	}
