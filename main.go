@@ -15,7 +15,6 @@ import (
 	//"pid"
 	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -36,6 +35,7 @@ var (
 type Complete struct {
 	Name string `json:"name"`
 	Cpu  string `json:"cpu"`
+	rubId	int
 }
 
 type Cacher struct {
@@ -87,39 +87,38 @@ func query_prepare(raw string) string {
 	return out.String()
 }
 
-func db_query(ids string) []byte {
+func db_query(buf *rankerList) []byte {
 
-	rows, err := db.Query(fmt.Sprintf("SELECT name,cpu FROM rubrics WHERE id IN(%s) ORDER BY FIELD(id,%s)", ids, ids))
 
-	if err != nil {
-		dbOpen()
-	}
+	var str bytes.Buffer
 
-	defer rows.Close()
+	str.WriteString("[")
+	length := len(*buf)-1
 
-	rubrics := make([]Complete, 0)
+	for i, r := range *buf {
 
-	for rows.Next() {
+		b, _ := json.Marshal(r.Item)
 
-		var name, cpu string
+		str.Write(b)
 
-		err = rows.Scan(&name, &cpu)
-
-		if err != nil {
-			panic(err)
+		if i > 10 {
+			break
 		}
-		rubrics = append(rubrics, Complete{name, cpu})
 
+		if i < length {
+			str.WriteString(",")
+		}
 	}
+	str.WriteString("]")
 
-	b, err := json.Marshal(rubrics)
-	return b
+	return str.Bytes()
 
 }
 
 type ranker struct {
 	rubId  int
 	weight int
+	Item *Complete
 }
 
 type rankerList []*ranker
@@ -139,37 +138,12 @@ func (r rankerList) Less(i, j int) bool {
 	return r[i].weight > r[j].weight
 }
 
-func (r *rankerList) String() string {
-
-	var str bytes.Buffer
-
-	length := len(*r) - 1
-
-	for i, rr := range *r {
-
-		str.WriteString(strconv.Itoa(rr.rubId))
-
-		if i > 10 {
-			break
-		}
-
-		if i < length {
-			str.WriteString(",")
-		}
-	}
-
-	if len(*r) > 0 {
-
-		return str.String()
-	}
-	return ""
-}
 
 func sphinx2(query string) []byte {
 
 	query = query_prepare(query)
 
-	buf := new(rankerList)
+	var buf rankerList
 
 	ccache := make(map[int]*ranker, 1)
 
@@ -178,14 +152,14 @@ func sphinx2(query string) []byte {
 
 		err := trie.VisitSubtree(patricia.Prefix(word), func(prefix patricia.Prefix, item patricia.Item) error {
 
-			rubId := item.(int)
+			rubItem := item.(*Complete)
 
-			if v, ok := ccache[rubId]; ok {
+			if v, ok := ccache[rubItem.rubId]; ok {
 				v.weight = v.weight + 1
 			} else {
-				rank := &ranker{rubId, 1}
-				ccache[rubId] = rank
-				*buf = append(*buf, rank)
+				rank := &ranker{rubItem.rubId, 1,rubItem}
+				ccache[rubItem.rubId] = rank
+				buf = append(buf, rank)
 			}
 
 			return nil
@@ -196,15 +170,10 @@ func sphinx2(query string) []byte {
 		}
 	}
 
-	sort.Sort(buf)
+	sort.Sort(&buf)
 
-	_ = (*buf).String()
+	return db_query(&buf)
 
-	//if ids != "" {
-	//	return db_query(ids)
-	//}
-
-	return []byte("[]")
 }
 
 func completer(w http.ResponseWriter, req *http.Request) {
@@ -299,7 +268,7 @@ func main() {
 		panic(err)
 	}
 
-	rows, err := db.Query("SELECT name,id FROM rubrics WHERE counter > 0")
+	rows, err := db.Query("SELECT name,id,cpu FROM rubrics WHERE counter > 0")
 
 	if err != nil {
 		panic(err)
@@ -310,22 +279,23 @@ func main() {
 	for rows.Next() {
 
 		var (
-			name string
+			name,cpu string
 			id   int
 		)
 
-		err = rows.Scan(&name, &id)
+		err = rows.Scan(&name, &id,&cpu)
 
 		if err != nil {
 			panic(err)
 		}
-		name = query_prepare(name)
+		clean_name := query_prepare(name)
 
-		for _, word := range strings.Fields(name) {
+		for _, word := range strings.Fields(clean_name) {
 
 			word = fmt.Sprintf("%s_%d", word, id)
 
-			trie.Insert(patricia.Prefix(word), id)
+			item := &Complete{name,cpu,id}
+			trie.Insert(patricia.Prefix(word), item)
 		}
 	}
 
