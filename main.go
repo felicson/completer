@@ -2,15 +2,18 @@ package main
 
 import (
 	"bytes"
-	"database/sql"
 	"flag"
 	"fmt"
-	_ "github.com/go-sql-driver/mysql"
-	"github.com/tchap/go-patricia/patricia"
+	"io"
 	"log"
+	"myprom/completer/storage"
 	"net"
 	"net/http"
 	"os"
+
+	_ "github.com/go-sql-driver/mysql"
+	"github.com/tchap/go-patricia/patricia"
+
 	//"pid"
 	"runtime"
 	"sort"
@@ -27,10 +30,11 @@ const (
 )
 
 var (
-	db *sql.DB
-
-	SKIPPED_WORDS          = map[string]bool{"и": true, "для": true, "к": true}
-	mysql_socket, mysql_db string
+	skippedWords = map[string]struct{}{
+		"и":   struct{}{},
+		"для": struct{}{},
+		"к":   struct{}{},
+	}
 
 	ccachePool sync.Pool
 	uniqPool   sync.Pool
@@ -38,13 +42,17 @@ var (
 	outPool    sync.Pool
 )
 
+type Storage interface {
+	GetEntries() ([]storage.Rubric, error)
+}
+
 type rubric struct {
 	Name string `json:"name"`
-	Cpu  string `json:"cpu"`
+	Slug string `json:"cpu"`
 }
 
 type Complete struct {
-	rubId  int
+	rubID  int
 	repeat uint8
 }
 
@@ -53,7 +61,7 @@ var rubrics map[int]rubric
 var trie *patricia.Trie //main data structure
 
 type ranker struct {
-	rubId     int
+	rubID     int
 	weight    uint8
 	uniqWords uint8
 	Item      *Complete
@@ -63,13 +71,13 @@ type rankerList []*ranker
 
 func isSkipped(word []byte) bool {
 
-	if _, ok := SKIPPED_WORDS[string(word)]; ok {
+	if _, ok := skippedWords[string(word)]; ok {
 
 		return ok
 	}
 	return false
 }
-func query_prepare(raw string) string {
+func queryPrepare(raw string) string {
 
 	//var tmp bytes.Buffer
 	out := outPool.Get().(*bytes.Buffer)
@@ -127,11 +135,11 @@ func query_prepare(raw string) string {
 	return out.String()
 }
 
-func db_query(buf rankerList, lenWords uint8) []byte {
+func makeJSON(buf rankerList, lenWords uint8) []byte {
 
 	var str bytes.Buffer
 
-	str.WriteString("[")
+	str.WriteString(`{"suggestions":[`)
 
 	for i, r := range buf {
 
@@ -144,16 +152,16 @@ func db_query(buf rankerList, lenWords uint8) []byte {
 			str.WriteString(",")
 		}
 
-		if rubric, ok := rubrics[r.Item.rubId]; ok {
+		if rubric, ok := rubrics[r.Item.rubID]; ok {
 
-			str.WriteString(`{"cpu":"`)
-			str.WriteString(rubric.Cpu)
-			str.WriteString(`", "name":"`)
+			str.WriteString(`{"value":"`)
 			str.WriteString(rubric.Name)
+			str.WriteString(`", "data":"`)
+			str.WriteString(rubric.Slug)
 			str.WriteString(`"}`)
 		}
 	}
-	str.WriteString("]")
+	str.WriteString("]}")
 	return str.Bytes()
 
 }
@@ -173,9 +181,9 @@ func (r rankerList) Less(i, j int) bool {
 	return r[i].weight > r[j].weight
 }
 
-func sphinx2(query string) []byte {
+func search(query string) ([]byte, error) {
 
-	b_query := query_prepare(query)
+	bQuery := queryPrepare(query)
 
 	var buf rankerList
 	var limit int
@@ -183,7 +191,7 @@ func sphinx2(query string) []byte {
 	uniq := uniqPool.Get().(map[string]bool)
 	ccache := ccachePool.Get().(map[int]*ranker)
 
-	words := strings.Fields(b_query)
+	words := strings.Fields(bQuery)
 
 	for _, word := range words {
 
@@ -193,22 +201,22 @@ func sphinx2(query string) []byte {
 			for _, rubItem := range rubItems {
 
 				//fmt.Println(word, rubItem.repeat, documentPathList[rubItem.hashId])
-				hashId := rubItem.rubId
-				wk := fmt.Sprintf("%s_%d", word, hashId)
+				hashID := rubItem.rubID
+				wk := fmt.Sprintf("%s_%d", word, hashID)
 
-				if v, ok := ccache[hashId]; ok {
+				if v, ok := ccache[hashID]; ok {
 
 					if _, ok = uniq[wk]; !ok {
 						v.weight = v.weight * 4
-						v.uniqWords += 1
+						v.uniqWords++
 						uniq[wk] = true
 					} else {
 						v.weight = v.weight + 1
 					}
 
 				} else {
-					rank := &ranker{hashId, rubItem.repeat, 1, rubItem}
-					ccache[hashId] = rank
+					rank := &ranker{hashID, rubItem.repeat, 1, rubItem}
+					ccache[hashID] = rank
 					uniq[wk] = true
 					buf = append(buf, rank)
 				}
@@ -217,7 +225,7 @@ func sphinx2(query string) []byte {
 		})
 
 		if err != nil {
-			panic(err)
+			return nil, err
 		}
 	}
 
@@ -229,9 +237,7 @@ func sphinx2(query string) []byte {
 		limit = DISPLAYLIMIT
 	}
 
-	return db_query(buf[:limit], uint8(len(words)))
-	//return nil
-
+	return makeJSON(buf[:limit], uint8(len(words))), nil
 }
 
 func completer(w http.ResponseWriter, req *http.Request) {
@@ -241,14 +247,19 @@ func completer(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Content-type", "application/json; charset=utf-8")
 
 	if query != "" {
-
-		w.Write(sphinx2(query))
+		result, err := search(query)
+		if err != nil {
+			log.Println(err)
+			io.WriteString(w, "[]")
+			return
+		}
+		w.Write(result)
 		return
 	}
-	w.Write([]byte("[]"))
-
+	io.WriteString(w, "[]")
 }
 
+//Run start server
 func Run(mux *http.ServeMux) error {
 
 	if _, err := os.Stat(SOCKET); err == nil {
@@ -286,31 +297,19 @@ func Run(mux *http.ServeMux) error {
 
 }
 
-func treeUpdater() {
+func treeUpdater(storage Storage) {
 
 	c := time.Tick(4 * time.Hour)
 
-	for _ = range c {
-		err := initTrie()
+	for range c {
+		err := initTrie(storage)
 		if err != nil {
-			fmt.Println(err)
+			log.Println(err)
 		}
 	}
 }
 
-func dbOpen() error {
-
-	var err error
-	db, err = sql.Open("mysql", fmt.Sprintf("myprom:weronica@unix(%s)/%s?parseTime=true", mysql_socket, mysql_db))
-	//fmt.Printf("+++++ %v\n",err)
-	return err
-
-}
-
 func init() {
-
-	flag.StringVar(&mysql_socket, "mysql-socket", "/run/mysqld/mysqld.sock", "mysql-socket=/sock/path.sock")
-	flag.StringVar(&mysql_db, "mysql-db", "myprom", "mysql-db=mydb")
 
 	uniqPool = sync.Pool{
 		New: func() interface{} {
@@ -335,36 +334,22 @@ func init() {
 
 }
 
-func initTrie() error {
+func initTrie(storage Storage) error {
 
 	rubrics = make(map[int]rubric, 100)
 	trie = patricia.NewTrie()
 
-	rows, err := db.Query("SELECT name,id,cpu FROM rubrics WHERE counter > 0")
-
+	entries, err := storage.GetEntries()
 	if err != nil {
-		return (err)
+		return err
 	}
+	for _, entry := range entries {
 
-	defer rows.Close()
+		cleanName := queryPrepare(entry.Name)
 
-	for rows.Next() {
+		words := strings.Fields(cleanName)
 
-		var (
-			name, cpu string
-			id        int
-		)
-
-		err = rows.Scan(&name, &id, &cpu)
-
-		if err != nil {
-			return (err)
-		}
-		clean_name := query_prepare(name)
-
-		words := strings.Fields(clean_name)
-
-		rubrics[id] = rubric{Cpu: cpu, Name: name}
+		rubrics[entry.ID] = rubric{Slug: entry.Slug, Name: entry.Name}
 
 		cache := make(map[string]*Complete)
 		var item *Complete
@@ -374,12 +359,11 @@ func initTrie() error {
 			key := word
 
 			if i, ok := cache[word]; ok {
-				//				fmt.Println("SKIP", word, "|||", path)
-				i.repeat += 1
+				i.repeat++
 
 			} else {
 
-				item = &Complete{id, 1}
+				item = &Complete{entry.ID, 1}
 				cache[word] = item
 
 				if exists := trie.Get(patricia.Prefix(key)); exists != nil {
@@ -402,23 +386,28 @@ func initTrie() error {
 
 func main() {
 
+	runtime.GOMAXPROCS(runtime.NumCPU())
+
+	var mysqlUser, mysqlPass, mysqlDB string
+	flag.StringVar(&mysqlUser, "mysql-user", "test", "mysql-user=test")
+	flag.StringVar(&mysqlPass, "mysql-password", "test", "mysql-password=test")
+	flag.StringVar(&mysqlDB, "mysql-db", "db", "mysql-db=mydb")
 	flag.Parse()
 
-	runtime.GOMAXPROCS(2)
-
-	err := dbOpen()
+	storage, err := storage.NewStorage(mysqlUser, mysqlPass, mysqlDB)
 	if err != nil {
 		panic(err)
 	}
 
-	err = initTrie()
+	if err := initTrie(storage); err != nil {
+		panic(err)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/completer/", completer)
 
-	go treeUpdater()
+	go treeUpdater(storage)
 
-	//pid.CreatePid()
 	err = Run(mux)
 	if err != nil {
 		panic(err)

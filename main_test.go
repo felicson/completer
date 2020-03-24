@@ -1,6 +1,7 @@
 package main
 
 import (
+	"myprom/completer/storage"
 	//	"fmt"
 	"testing"
 )
@@ -9,22 +10,22 @@ func BenchmarkSimple(b *testing.B) {
 
 	b.ReportAllocs()
 	for n := 0; n < b.N; n++ {
-		_ = query_prepare("Труба профильная")
+		_ = queryPrepare("Труба профильная")
 	}
 }
 
 func BenchmarkPatricia(b *testing.B) {
 	b.StopTimer()
-	err := dbOpen()
+	storage, err := storage.NewStorage("test", "test", "test")
 	if err != nil {
 		panic(err)
 	}
 
-	initTrie()
+	initTrie(storage)
 
 	b.StartTimer()
 
 	for n := 0; n < b.N; n++ {
-		_ = sphinx2("Труба профильная")
+		search("Труба профильная")
 	}
 }

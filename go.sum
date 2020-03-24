@@ -1,0 +1,4 @@
+github.com/go-sql-driver/mysql v1.3.0 h1:pgwjLi/dvffoP9aabwkT3AKpXQM93QARkjFhDDqC1UE=
+github.com/go-sql-driver/mysql v1.3.0/go.mod h1:zAC/RDZ24gD3HViQzih4MyKcchzm+sOG5ZlKdlhCg5w=
+github.com/tchap/go-patricia v2.2.7-0.20170901200111-5ad6cdb7538b+incompatible h1:6Y9KKegKShVKzH4+eFqeMzmYWonarzYnzqj9yvV9m9w=
+github.com/tchap/go-patricia v2.2.7-0.20170901200111-5ad6cdb7538b+incompatible/go.mod h1:bmLyhP68RS6kStMGxByiQ23RP/odRBOTVjwp2cDyi6I=
