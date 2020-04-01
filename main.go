@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -10,6 +11,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/tchap/go-patricia/patricia"
@@ -284,12 +287,29 @@ func Run(mux *http.ServeMux) error {
 	}
 
 	log.Print("Change mode for socket")
-
 	log.Print("Run server!!!")
 
-	err = http.Serve(ln, mux)
+	server := http.Server{
+		Handler: mux,
+	}
+	sigint := make(chan os.Signal)
+	signal.Notify(sigint, syscall.SIGTERM, syscall.SIGINT)
 
-	if err != nil {
+	e := make(chan error)
+	go func() {
+		e <- server.Serve(ln)
+	}()
+
+	select {
+	case err := <-e:
+		return err
+	case <-sigint:
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	log.Print("Starting shutdown server")
+	if err := server.Shutdown(ctx); err != nil {
 		return err
 	}
 
